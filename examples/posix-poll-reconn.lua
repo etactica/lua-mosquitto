@@ -13,6 +13,7 @@ local cfg = {
     TOPIC_DATA = "data/#",
     TOPIC_COMMAND = "command/#",
     HOST = "localhost",
+    must_exit = false,
     needs_reconn = 0,
 }
 
@@ -20,13 +21,20 @@ mosq.init()
 local mqtt = mosq.new(cfg.MOSQ_CLIENT_ID, true)
 
 local function mqtt_reconnector()
-    local ok, code, err = mqtt:connect_async(cfg.HOST, 1883, 60)
+    print("current reconn iteration = ", cfg.needs_reconn)
+    local function calculate_backoff(basetime, iter)
+        if iter < 5 then return basetime * 2 end
+        if iter < 10 then return basetime * 4 end
+        return basetime * 8
+    end
+
+    local ok, code, err = mqtt:connect(cfg.HOST, 1883, 60)
     if not ok then
         print(string.format("Failed to make MQTT connection: %d:%s", code, err))
         cfg.needs_reconn = cfg.needs_reconn + 1
-        return {}
+        return {}, calculate_backoff(cfg.MOSQ_IDLE_LOOP_MS, cfg.needs_reconn)
     end
-    return { [mqtt:socket()] = {events={ IN=true, OUT=true } }, }
+    return { [mqtt:socket()] = {events={ IN=true, OUT=true } }, }, cfg.MOSQ_IDLE_LOOP_MS
 end
 
 local function handle_data(topic, payload)
@@ -35,6 +43,7 @@ end
 
 local function handle_command(topic, payload)
     print(string.format("Received command on topic %s -> %s", topic, payload))
+    if topic:find("quit") then cfg.must_exit = true end
 end
 
 mqtt.ON_CONNECT = function()
@@ -48,6 +57,12 @@ mqtt.ON_CONNECT = function()
         error(string.format("Aborting, unable to subscribe to command topic: %d:%s", code, nok))
     end
     print(string.format("MQTT (RE)Connected happily to %s", cfg.HOST))
+    cfg.needs_reconn = 0
+end
+
+mqtt.ON_DISCONNECT = function(code)
+    print("mosquitto disconnect with code", code)
+    cfg.needs_reconn = cfg.needs_reconn + 1
 end
 
 mqtt.ON_MESSAGE = function(mid, topic, payload, qos, retain)
@@ -59,29 +74,27 @@ mqtt.ON_MESSAGE = function(mid, topic, payload, qos, retain)
     end
 end
 
-local fds = mqtt_reconnector()
 
-while true do
-    local x = P.poll(fds, cfg.MOSQ_IDLE_LOOP_MS)
+local fds, backoff_time
+local function mainloop()
+    local x = P.poll(fds, backoff_time)
     local res, code, nok
     if x > 0 then
         for fd in pairs(fds) do
             if fds[fd].revents.IN then
                 res, code, nok = mqtt:loop_read()
                 if not res then
-                    cfg.needs_reconn = cfg.needs_reconn + 1
                     print(string.format("MQTT loop read failed returned %d:%s", code, nok))
-                else
-                    cfg.needs_reconn = 0
+                    fds, backoff_time = mqtt_reconnector()
+                    return
                 end
             end
             if fds[fd].revents.OUT then
                 res, code, nok = mqtt:loop_write()
                 if not res then
-                    cfg.needs_reconn = cfg.needs_reconn + 1
                     print(string.format("MQTT loop write failed returned %d:%s", code, nok))
-                else
-                    cfg.needs_reconn = 0
+                    fds, backoff_time = mqtt_reconnector()
+                    return
                 end
             end
         end
@@ -93,14 +106,16 @@ while true do
     res, code, nok = mqtt:loop_misc()
     if not res then
         -- This is largely redundant with the loop read/write error handling.
-        print(string.format("MQTT Misc loop faiure: %d:%s", code, nok))
+        print(string.format("MQTT Misc loop failure: %d:%s", code, nok))
+        fds, backoff_time = mqtt_reconnector()
+        return
     end
-    if fds[mqtt:socket()] then
-        fds[mqtt:socket()].events.OUT = mqtt:want_write()
-    end
+    -- Should always be valid at this point
+    fds[mqtt:socket()].events.OUT = mqtt:want_write()
 
-    if not mqtt:socket() or cfg.needs_reconn > 0 then
-        print(string.format("MQTT connection lost, reconnecting count: %d", cfg.needs_reconn))
-        fds = mqtt_reconnector()
-    end
+end
+
+fds, backoff_time = mqtt_reconnector()
+while not cfg.must_exit do
+    mainloop()
 end
